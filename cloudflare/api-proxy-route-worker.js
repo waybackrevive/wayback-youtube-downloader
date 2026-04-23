@@ -10,23 +10,35 @@
  *     Route:   waybackrevive.com/api/*
  *     Zone:    waybackrevive.com
  *
- * Set environment variable in the worker settings:
- *   BACKEND_URL = https://waybackrevive-api.onrender.com
+ * Set environment variable in the worker Settings → Variables:
+ *   BACKEND_URL = https://wayback-youtube-downloader.onrender.com
  */
+
+const ALLOWED_ORIGINS = [
+    'https://waybackrevive.com',
+    'https://www.waybackrevive.com',
+];
+
+function getAllowedOrigin(request) {
+    const origin = request.headers.get('Origin') || '';
+    return ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
+}
 
 export default {
     async fetch(request, env) {
         const url = new URL(request.url);
+        const allowedOrigin = getAllowedOrigin(request);
 
         // CORS preflight
         if (request.method === 'OPTIONS') {
             return new Response(null, {
                 status: 204,
                 headers: {
-                    'Access-Control-Allow-Origin': 'https://waybackrevive.com',
+                    'Access-Control-Allow-Origin': allowedOrigin,
                     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
                     'Access-Control-Allow-Headers': 'Content-Type, x-api-key',
                     'Access-Control-Max-Age': '86400',
+                    'Vary': 'Origin',
                 },
             });
         }
@@ -36,7 +48,10 @@ export default {
         if (!BACKEND) {
             return Response.json(
                 { detail: 'BACKEND_URL is not configured in Worker environment variables.' },
-                { status: 503 }
+                {
+                    status: 503,
+                    headers: { 'Access-Control-Allow-Origin': allowedOrigin },
+                }
             );
         }
 
@@ -59,7 +74,8 @@ export default {
 
             const resp = await fetch(proxyReq);
             const headers = new Headers(resp.headers);
-            headers.set('Access-Control-Allow-Origin', 'https://waybackrevive.com');
+            headers.set('Access-Control-Allow-Origin', allowedOrigin);
+            headers.set('Vary', 'Origin');
             headers.set('Cache-Control', 'no-cache, no-store');
 
             return new Response(resp.body, {
@@ -72,7 +88,10 @@ export default {
                 { detail: `Backend unreachable: ${err.message}` },
                 {
                     status: 503,
-                    headers: { 'Access-Control-Allow-Origin': 'https://waybackrevive.com' },
+                    headers: {
+                        'Access-Control-Allow-Origin': allowedOrigin,
+                        'Vary': 'Origin',
+                    },
                 }
             );
         }
