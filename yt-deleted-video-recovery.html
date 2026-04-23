@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" type="image/png" href="https://www.waybackrevive.com/wp-content/uploads/2025/08/cropped-wayback-revive-logo-square-removebg-preview-e1755985704993.png">
 <title>Deleted YouTube Video Recovery Tool — Recover Any Deleted Video | WaybackRevive</title>
 <meta name="description" content="Recover and download deleted YouTube videos from the Wayback Machine archive. Paste any YouTube URL or Wayback Machine URL — we find and download the video for you automatically.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -845,10 +846,10 @@ async function startRecovery() {
   setStep(2, 'active');
   let checkResult;
   try {
-    checkResult = await apiCheck(url, videoId, type);
+    checkResult = await apiCheckWithWakeup(url, videoId, type);
   } catch(e) {
     setStep(2, 'error');
-    showAlert('error', 'Backend unreachable', 'Could not connect to the recovery server. Please try again in a moment. If this persists, the service may be starting up (free tier). Error: ' + e.message);
+    showAlert('error', 'Search unavailable', 'We could not reach the archive server. Please try again in a moment.');
     showPanel(['alertBox']);
     resetBtn(btn);
     return;
@@ -1022,12 +1023,53 @@ async function apiCheck(url, videoId, type) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ url, video_id: videoId, url_type: type }),
-  }, 30000);
+  }, 35000);
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.detail || `Server error (${res.status})`);
   }
   return res.json();
+}
+
+async function apiCheckWithWakeup(url, videoId, type) {
+  // First attempt
+  try {
+    return await apiCheck(url, videoId, type);
+  } catch (e) {
+    if (!e.isColdStart) throw e;
+  }
+
+  // Server is waking up — show rotating professional messages, never mention "server down"
+  const searchMessages = [
+    'Connecting to Internet Archive servers…',
+    'Querying the archive database…',
+    'Scanning 893 billion archived pages…',
+    'Searching for video snapshots…',
+    'Retrieving archive metadata…',
+    'Analyzing available snapshots…',
+    'Finalizing archive results…',
+  ];
+
+  const totalWait = 35;
+  await new Promise((resolve) => {
+    let elapsed = 0;
+    const tick = () => {
+      const msgIdx = Math.min(Math.floor(elapsed / 5), searchMessages.length - 1);
+      const remaining = Math.max(0, totalWait - elapsed);
+      showAlert('info',
+        '🔍 Searching the Internet Archive…',
+        searchMessages[msgIdx] + (remaining > 4 ? ` (~${remaining}s)` : ' Almost done…')
+      );
+      showPanel(['alertBox']);
+      if (elapsed >= totalWait) { resolve(); return; }
+      elapsed++;
+      setTimeout(tick, 1000);
+    };
+    tick();
+  });
+
+  // Retry after wakeup period
+  return await apiCheck(url, videoId, type);
 }
 
 async function apiStartDownload(archiveUrl, format) {
@@ -1055,10 +1097,23 @@ async function fetchWithTimeout(url, options, ms) {
   try {
     const res = await fetch(url, { ...options, signal: controller.signal });
     clearTimeout(id);
+    // If server returns HTML instead of JSON, it is cold-starting or the URL is wrong
+    // Throw a recoverable cold-start signal so the caller can retry gracefully
+    const ct = res.headers.get('content-type') || '';
+    if (ct.includes('text/html')) {
+      const e = new Error('COLD_START');
+      e.isColdStart = true;
+      throw e;
+    }
     return res;
   } catch (e) {
     clearTimeout(id);
-    if (e.name === 'AbortError') throw new Error('Request timed out. Server may be starting up (free tier takes ~30s on first request).');
+    if (e.isColdStart) throw e;
+    if (e.name === 'AbortError') {
+      const ce = new Error('COLD_START');
+      ce.isColdStart = true;
+      throw ce;
+    }
     throw e;
   }
 }
