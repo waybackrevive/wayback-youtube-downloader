@@ -1,0 +1,8 @@
+name = "waybackrevive-tool"
+compatibility_date = "2024-09-23"
+pages_build_output_dir = "."
+
+# Replace this with your actual Render.com backend URL after deploying
+# e.g. https://waybackrevive-api.onrender.com
+[vars]
+BACKEND_URL = "https://waybackrevive-api.onrender.com"

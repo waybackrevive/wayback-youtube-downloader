@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: waybackrevive-api
+    runtime: python
+    buildCommand: chmod +x build.sh && ./build.sh
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    plan: free
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: "*"
+      - key: DOWNLOAD_DIR
+        value: /tmp/wayback_downloads
