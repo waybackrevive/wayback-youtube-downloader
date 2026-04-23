@@ -364,6 +364,10 @@ def do_download(job_id: str, url: str, fmt: str):
 def root():
     return {"service": "WaybackRevive API", "status": "online", "version": "1.0.0"}
 
+@app.get("/api/health")
+def health():
+    return {"service": "WaybackRevive API", "status": "online", "version": "1.0.0"}
+
 
 @app.post("/api/check")
 async def check_video(req: CheckRequest, request: Request):

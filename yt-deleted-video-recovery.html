@@ -1423,7 +1423,8 @@
             </div>
             <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
               <p class="url-hint">Supports: <strong>youtube.com</strong>, <strong>youtu.be</strong>,
-                <strong>web.archive.org</strong> — <a href="#faq">See FAQ for examples</a></p>
+                <strong>web.archive.org</strong> — <a href="#faq">See FAQ for examples</a>
+              </p>
               <span class="url-type hidden" id="urlTypeBadge"></span>
             </div>
           </div>
@@ -1752,6 +1753,44 @@
     // CONFIG — Update BACKEND_URL after deployment
     // ══════════════════════════════════════════════
     const BACKEND_URL = ''; // Proxied via Cloudflare Worker — API calls go to same origin
+
+    // ══════════════════════════════════════════════
+    // SERVER PRE-WARM
+    // Ping the backend silently as soon as the page loads.
+    // Render free tier wakes in 50-90s. By the time the user
+    // reads the page, types a URL, and clicks Find Video (~30-60s),
+    // the server is already awake — zero wait for the user.
+    // Also pings every 12 min while tab is open to prevent re-sleep.
+    // ══════════════════════════════════════════════
+    const serverState = { warm: false, warming: false, warmPromise: null };
+
+    function pingBackend() {
+      return fetch(`${BACKEND_URL}/api/health`, {
+        method: 'GET',
+        signal: AbortSignal.timeout(15000),
+      })
+        .then(r => {
+          const ct = r.headers.get('content-type') || '';
+          if (r.ok && ct.includes('application/json')) {
+            serverState.warm = true;
+          }
+        })
+        .catch(() => { /* silent — never show ping errors to user */ });
+    }
+
+    function startPreWarm() {
+      if (serverState.warmPromise) return serverState.warmPromise;
+      serverState.warming = true;
+      serverState.warmPromise = pingBackend().then(() => {
+        serverState.warming = false;
+      });
+      // Keep-alive: ping every 12 minutes to prevent Render sleeping again
+      setInterval(pingBackend, 12 * 60 * 1000);
+      return serverState.warmPromise;
+    }
+
+    // Fire immediately on script load
+    startPreWarm();
 
     // ══════════════════════════════════════════════
     // STATE
@@ -2187,9 +2226,16 @@
     }
 
     async function apiCheckWithWakeup(url, videoId, type) {
-      // First attempt — no delay
+      // If pre-warm already succeeded, just call directly — no waiting
+      if (serverState.warm) {
+        return await apiCheck(url, videoId, type, 35000);
+      }
+
+      // First attempt — short timeout to quickly detect cold-start
       try {
-        return await apiCheck(url, videoId, type, 12000);
+        const result = await apiCheck(url, videoId, type, 12000);
+        serverState.warm = true;
+        return result;
       } catch (e) {
         if (!e.isColdStart) throw e;
       }
@@ -2228,6 +2274,7 @@
           await delay(RETRY_EVERY_MS);
           try {
             const result = await apiCheck(url, videoId, type, 12000);
+            serverState.warm = true;
             return result; // success — exit loop
           } catch (e) {
             if (!e.isColdStart) throw e; // real error — surface it
