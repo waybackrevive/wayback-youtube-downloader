@@ -24,6 +24,7 @@ from typing import Optional
 
 import requests
 import yt_dlp
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -157,10 +158,39 @@ def ts_age(ts: str) -> str:
         return ""
 
 
+def get_wayback_available(video_id: str) -> Optional[dict]:
+    """
+    Fast Wayback availability check — returns the single closest snapshot.
+    Usually responds in 2-3 seconds, much faster than CDX.
+    """
+    yt_url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        resp = requests.get(
+            "https://archive.org/wayback/available",
+            params={"url": yt_url},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        closest = data.get("archived_snapshots", {}).get("closest", {})
+        if closest.get("available") and closest.get("url"):
+            ts = closest.get("timestamp", "")
+            return {
+                "timestamp": ts,
+                "url": closest["url"],
+                "date_formatted": format_timestamp(ts),
+                "age": ts_age(ts),
+            }
+    except Exception as e:
+        log.warning(f"Wayback availability API failed for {video_id}: {e}")
+    return None
+
+
 def search_wayback(video_id: str, limit: int = 8) -> list[dict]:
     """
     Query the CDX API for all snapshots of a YouTube video.
     Returns a list of {timestamp, url, date_formatted, age} dicts.
+    Retries once with a longer timeout before giving up.
     """
     yt_url = f"https://www.youtube.com/watch?v={video_id}"
     cdx_url = (
@@ -172,29 +202,72 @@ def search_wayback(video_id: str, limit: int = 8) -> list[dict]:
         f"&limit={limit}"
         "&collapse=timestamp:8"   # one per day
     )
-    try:
-        resp = requests.get(cdx_url, timeout=15)
-        resp.raise_for_status()
-        rows = resp.json()
-        if not rows or len(rows) <= 1:
-            return []
-        header = rows[0]
-        results = []
-        for row in rows[1:]:
-            ts = row[0]
-            wayback_url = f"https://web.archive.org/web/{ts}/https://www.youtube.com/watch?v={video_id}"
-            results.append({
-                "timestamp": ts,
-                "url": wayback_url,
-                "date_formatted": format_timestamp(ts),
-                "age": ts_age(ts),
-            })
-        # Sort newest first
-        results.sort(key=lambda x: x["timestamp"], reverse=True)
-        return results
-    except Exception as e:
-        log.warning(f"CDX search failed for {video_id}: {e}")
-        return []
+    for attempt, timeout in enumerate([8, 14]):
+        try:
+            resp = requests.get(cdx_url, timeout=timeout)
+            resp.raise_for_status()
+            rows = resp.json()
+            if not rows or len(rows) <= 1:
+                return []
+            results = []
+            for row in rows[1:]:
+                ts = row[0]
+                wayback_url = f"https://web.archive.org/web/{ts}/https://www.youtube.com/watch?v={video_id}"
+                results.append({
+                    "timestamp": ts,
+                    "url": wayback_url,
+                    "date_formatted": format_timestamp(ts),
+                    "age": ts_age(ts),
+                })
+            results.sort(key=lambda x: x["timestamp"], reverse=True)
+            return results
+        except requests.exceptions.Timeout:
+            if attempt == 0:
+                log.warning(f"CDX timeout (8s) for {video_id}, retrying with 14s…")
+                continue
+            log.warning(f"CDX search timed out for {video_id} after both attempts")
+        except Exception as e:
+            log.warning(f"CDX search failed for {video_id}: {e}")
+            break
+    return []
+
+
+def search_archives_robust(video_id: str) -> list[dict]:
+    """
+    Run CDX search and the availability API in parallel.
+    CDX gives multiple snapshots; availability API is a fast fallback.
+    Returns merged, deduped list sorted newest-first.
+    """
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        cdx_future = executor.submit(search_wayback, video_id, 8)
+        avail_future = executor.submit(get_wayback_available, video_id)
+
+        archives: list[dict] = []
+        avail_entry: Optional[dict] = None
+
+        try:
+            archives = cdx_future.result(timeout=25) or []
+        except Exception:
+            archives = []
+
+        try:
+            avail_entry = avail_future.result(timeout=10)
+        except Exception:
+            avail_entry = None
+
+    if archives:
+        # Availability API may give a newer/different snapshot — add if unique
+        if avail_entry:
+            existing_days = {a["timestamp"][:8] for a in archives}
+            if avail_entry["timestamp"][:8] not in existing_days:
+                archives.insert(0, avail_entry)
+        return archives
+
+    if avail_entry:
+        log.info(f"CDX empty/failed for {video_id}, used availability API fallback")
+        return [avail_entry]
+
+    return []
 
 
 def get_video_info_ytdlp(url: str) -> Optional[dict]:
@@ -390,8 +463,8 @@ async def check_video(req: CheckRequest, request: Request):
     # ── If it's a direct Wayback URL, try to extract info directly ──
     if "archive.org" in url and video_id:
         log.info(f"Direct wayback URL — video_id={video_id}")
-        # Search CDX for more snapshots
-        archives = search_wayback(video_id, limit=6)
+        # Search CDX + availability API in parallel for more snapshots
+        archives = search_archives_robust(video_id)
         info = get_video_info_ytdlp(url)
         if not info and archives:
             info = get_video_info_ytdlp(archives[0]["url"])
@@ -424,7 +497,7 @@ async def check_video(req: CheckRequest, request: Request):
 
     # ── Video not live — search Internet Archive ──
     log.info(f"Video not on YouTube — searching Wayback Machine for {video_id}")
-    archives = search_wayback(video_id, limit=8)
+    archives = search_archives_robust(video_id)
 
     if not archives:
         result.update({
